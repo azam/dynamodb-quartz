@@ -2,6 +2,9 @@ package io.azam.aws.dynamodb.quartz;
 
 import java.net.MalformedURLException;
 import java.net.URL;
+import java.text.ParseException;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Date;
 import java.util.HashMap;
@@ -28,11 +31,15 @@ import org.quartz.Trigger.CompletedExecutionInstruction;
 import org.quartz.Trigger.TriggerState;
 import org.quartz.TriggerKey;
 import org.quartz.impl.matchers.GroupMatcher;
+import org.quartz.impl.matchers.StringMatcher.StringOperatorName;
+import org.quartz.impl.triggers.CronTriggerImpl;
+import org.quartz.impl.triggers.SimpleTriggerImpl;
 import org.quartz.spi.ClassLoadHelper;
 import org.quartz.spi.JobStore;
 import org.quartz.spi.OperableTrigger;
 import org.quartz.spi.SchedulerSignaler;
 import org.quartz.spi.TriggerFiredResult;
+import org.quartz.utils.Key;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -46,14 +53,30 @@ import com.amazonaws.auth.profile.ProfileCredentialsProvider;
 import com.amazonaws.regions.Region;
 import com.amazonaws.regions.Regions;
 import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClient;
-import com.amazonaws.services.dynamodbv2.document.Item;
+import com.amazonaws.services.dynamodbv2.model.AttributeAction;
+import com.amazonaws.services.dynamodbv2.model.AttributeDefinition;
 import com.amazonaws.services.dynamodbv2.model.AttributeValue;
+import com.amazonaws.services.dynamodbv2.model.AttributeValueUpdate;
+import com.amazonaws.services.dynamodbv2.model.ComparisonOperator;
+import com.amazonaws.services.dynamodbv2.model.Condition;
 import com.amazonaws.services.dynamodbv2.model.ConditionalCheckFailedException;
 import com.amazonaws.services.dynamodbv2.model.DeleteItemRequest;
 import com.amazonaws.services.dynamodbv2.model.DeleteItemResult;
 import com.amazonaws.services.dynamodbv2.model.ExpectedAttributeValue;
+import com.amazonaws.services.dynamodbv2.model.GetItemRequest;
+import com.amazonaws.services.dynamodbv2.model.GetItemResult;
+import com.amazonaws.services.dynamodbv2.model.KeySchemaElement;
+import com.amazonaws.services.dynamodbv2.model.KeyType;
+import com.amazonaws.services.dynamodbv2.model.ProvisionedThroughput;
 import com.amazonaws.services.dynamodbv2.model.PutItemRequest;
 import com.amazonaws.services.dynamodbv2.model.PutItemResult;
+import com.amazonaws.services.dynamodbv2.model.ReturnValue;
+import com.amazonaws.services.dynamodbv2.model.ScalarAttributeType;
+import com.amazonaws.services.dynamodbv2.model.ScanRequest;
+import com.amazonaws.services.dynamodbv2.model.ScanResult;
+import com.amazonaws.services.dynamodbv2.model.UpdateItemRequest;
+import com.amazonaws.services.dynamodbv2.model.UpdateItemResult;
+import com.amazonaws.services.dynamodbv2.util.Tables;
 
 /**
  * {@link org.quartz.core.JobStore} implementation for DynamoDB
@@ -62,7 +85,7 @@ import com.amazonaws.services.dynamodbv2.model.PutItemResult;
  */
 public class DynamoDBJobStore implements JobStore {
 	// Defaults
-	public static final String DEFAULT_ENDPOINT = "http://localhost:8080";
+	public static final String DEFAULT_ENDPOINT = "http://localhost:8000";
 	public static final String DEFAULT_JOBS = "jobs";
 	public static final String DEFAULT_CALENDARS = "calendars";
 	public static final String DEFAULT_TRIGGERS = "triggers";
@@ -74,6 +97,7 @@ public class DynamoDBJobStore implements JobStore {
 	public static final String KEY_CLASS = "class";
 	public static final String KEY_GROUP = "group";
 	public static final String KEY_NAME = "name";
+	public static final String KEY_STATE = "state";
 	public static final String KEY_TYPE = "type";
 	public static final String KEY_DESCRIPTION = "description";
 	public static final String KEY_DURABLE = "durable";
@@ -95,6 +119,11 @@ public class DynamoDBJobStore implements JobStore {
 	public static final String KEY_COUNT = "count";
 	public static final String KEY_INTERVAL = "interval";
 	public static final String KEY_TIMES = "times";
+
+	// Trigger types
+	public static final String TRIGGERTYPE_CRON = "cron";
+	public static final String TRIGGERTYPE_SIMPLE = "simple";
+	public static final String TRIGGERTYPE_UNKNOWN = "unknown";
 
 	// Scheduler states
 	public static final int SCHEDULERSTATE_INITIALIZED = 0;
@@ -118,6 +147,7 @@ public class DynamoDBJobStore implements JobStore {
 	private String tableNameJobs = DEFAULT_JOBS;
 	private String tableNameCalendars = DEFAULT_CALENDARS;
 	private String tableNameTriggers = DEFAULT_TRIGGERS;
+	private String prefix = null;
 	private Region region = Region.getRegion(Regions.US_WEST_1);
 	private boolean useEndpoint = false;
 	private String endpoint = DEFAULT_ENDPOINT;
@@ -130,6 +160,7 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public void initialize(ClassLoadHelper loadHelper,
 			SchedulerSignaler signaler) throws SchedulerConfigException {
+		this.log.trace("initialize");
 		this.loadHelper = loadHelper;
 		this.signaler = signaler;
 		AWSCredentialsProviderChain auth = new AWSCredentialsProviderChain(
@@ -139,51 +170,62 @@ public class DynamoDBJobStore implements JobStore {
 				new InstanceProfileCredentialsProvider());
 		this.client = new AmazonDynamoDBClient(auth);
 		if (this.useEndpoint) {
+			this.log.info("Using endpoint: " + this.endpoint);
 			this.client.withEndpoint(this.endpoint);
 		} else {
+			this.log.info("Using region: " + this.region.getName());
 			this.client.withRegion(this.region);
 		}
+		init();
 	}
 
 	@Override
 	public synchronized void schedulerStarted() throws SchedulerException {
+		this.log.trace("schedulerStarted");
 		// TODO
 		this.schedulerState = SCHEDULERSTATE_RUNNING;
 	}
 
 	@Override
 	public synchronized void schedulerPaused() {
+		this.log.trace("schedulerPaused");
 		this.schedulerState = SCHEDULERSTATE_PAUSED;
 	}
 
 	@Override
 	public synchronized void schedulerResumed() {
+		this.log.trace("schedulerResumed");
 		this.schedulerState = SCHEDULERSTATE_RUNNING;
 	}
 
 	@Override
 	public synchronized void shutdown() {
+		this.log.trace("shutdown");
 		this.schedulerState = SCHEDULERSTATE_STOPPED;
 	}
 
 	@Override
 	public boolean supportsPersistence() {
+		this.log.trace("supportsPersistence");
 		return true;
 	}
 
 	@Override
 	public long getEstimatedTimeToReleaseAndAcquireTrigger() {
+		this.log.trace("getEstimatedTimeToReleaseAndAcquireTrigger");
 		return this.triggerEstimate;
 	}
 
 	@Override
 	public boolean isClustered() {
+		this.log.trace("isClustered");
 		return true;
 	}
 
 	@Override
 	public void storeJobAndTrigger(JobDetail newJob, OperableTrigger newTrigger)
 			throws ObjectAlreadyExistsException, JobPersistenceException {
+		this.log.trace("storeJobAndTrigger");
 		try {
 			storeJob(newJob, false);
 		} catch (ObjectAlreadyExistsException e) {
@@ -205,6 +247,7 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public void storeJob(JobDetail newJob, boolean replaceExisting)
 			throws ObjectAlreadyExistsException, JobPersistenceException {
+		this.log.trace("storeJob");
 		PutItemRequest req = new PutItemRequest();
 		req.withTableName(this.tableNameJobs);
 		req.withItem(jobToItem(newJob));
@@ -230,6 +273,7 @@ public class DynamoDBJobStore implements JobStore {
 			Map<JobDetail, Set<? extends Trigger>> triggersAndJobs,
 			boolean replace) throws ObjectAlreadyExistsException,
 			JobPersistenceException {
+		this.log.trace("storeJobsAndTriggers");
 		Set<JobKey> jobKeys = new HashSet<JobKey>();
 		Set<TriggerKey> triggerKeys = new HashSet<TriggerKey>();
 		try {
@@ -263,13 +307,14 @@ public class DynamoDBJobStore implements JobStore {
 
 	@Override
 	public boolean removeJob(JobKey jobKey) throws JobPersistenceException {
+		this.log.trace("removeJob");
+		Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
+		km.put(KEY_KEY, new AttributeValue(formatKey(jobKey)));
+		DeleteItemRequest req = new DeleteItemRequest();
+		req.withTableName(this.tableNameJobs);
+		req.withKey(km);
+		req.addExpectedEntry(KEY_KEY, new ExpectedAttributeValue(true));
 		try {
-			Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
-			km.put(KEY_KEY, new AttributeValue(jobKey.toString()));
-			DeleteItemRequest req = new DeleteItemRequest();
-			req.withTableName(this.tableNameJobs);
-			req.withKey(km);
-			req.addExpectedEntry(KEY_KEY, new ExpectedAttributeValue(true));
 			DeleteItemResult res = this.client.deleteItem(req);
 			return true;
 		} catch (ConditionalCheckFailedException e) {
@@ -287,6 +332,7 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public boolean removeJobs(List<JobKey> jobKeys)
 			throws JobPersistenceException {
+		this.log.trace("removeJobs");
 		// TODO: Use batch write
 		boolean removed = true;
 		for (JobKey k : jobKeys) {
@@ -297,13 +343,37 @@ public class DynamoDBJobStore implements JobStore {
 
 	@Override
 	public JobDetail retrieveJob(JobKey jobKey) throws JobPersistenceException {
-		// TODO Auto-generated method stub
+		this.log.trace("retrieveJob");
+		Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
+		km.put(KEY_KEY, new AttributeValue(formatKey(jobKey)));
+		GetItemRequest req = new GetItemRequest();
+		req.withTableName(this.tableNameJobs);
+		req.withKey(km);
+		try {
+			GetItemResult res = this.client.getItem(req);
+			Map<String, AttributeValue> item = res.getItem();
+			if (item != null && !item.isEmpty()) {
+				return itemToJob(item);
+			}
+		} catch (ConditionalCheckFailedException e) {
+			this.log.error(e.getMessage(), e);
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (ClassNotFoundException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
 		return null;
 	}
 
 	@Override
 	public void storeTrigger(OperableTrigger newTrigger, boolean replaceExisting)
 			throws ObjectAlreadyExistsException, JobPersistenceException {
+		this.log.trace("storeTrigger");
 		PutItemRequest req = new PutItemRequest();
 		req.withTableName(this.tableNameTriggers);
 		req.withItem(triggerToItem(newTrigger));
@@ -327,13 +397,14 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public boolean removeTrigger(TriggerKey triggerKey)
 			throws JobPersistenceException {
+		this.log.trace("removeTrigger");
+		Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
+		km.put(KEY_KEY, new AttributeValue(formatKey(triggerKey)));
+		DeleteItemRequest req = new DeleteItemRequest();
+		req.withTableName(this.tableNameTriggers);
+		req.withKey(km);
+		req.addExpectedEntry(KEY_KEY, new ExpectedAttributeValue(true));
 		try {
-			Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
-			km.put(KEY_KEY, new AttributeValue(triggerKey.toString()));
-			DeleteItemRequest req = new DeleteItemRequest();
-			req.withTableName(this.tableNameTriggers);
-			req.withKey(km);
-			req.addExpectedEntry(KEY_KEY, new ExpectedAttributeValue(true));
 			DeleteItemResult res = this.client.deleteItem(req);
 			return true;
 		} catch (ConditionalCheckFailedException e) {
@@ -351,6 +422,7 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public boolean removeTriggers(List<TriggerKey> triggerKeys)
 			throws JobPersistenceException {
+		this.log.trace("removeTriggers");
 		// TODO: Use batch write
 		boolean removed = true;
 		for (TriggerKey k : triggerKeys) {
@@ -362,40 +434,108 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public boolean replaceTrigger(TriggerKey triggerKey,
 			OperableTrigger newTrigger) throws JobPersistenceException {
-		// TODO Auto-generated method stub
+		this.log.trace("replaceTrigger");
+		// TODO: fetch old jobkey
+		storeTrigger(newTrigger, true);
 		return false;
 	}
 
 	@Override
 	public OperableTrigger retrieveTrigger(TriggerKey triggerKey)
 			throws JobPersistenceException {
-		// TODO Auto-generated method stub
+		this.log.trace("retrieveTrigger");
+		Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
+		km.put(KEY_KEY, new AttributeValue(formatKey(triggerKey)));
+		GetItemRequest req = new GetItemRequest();
+		req.withTableName(this.tableNameTriggers);
+		req.withKey(km);
+		try {
+			GetItemResult res = this.client.getItem(req);
+			Map<String, AttributeValue> item = res.getItem();
+			if (item != null && !item.isEmpty()) {
+				return itemToTrigger(item);
+			}
+		} catch (ConditionalCheckFailedException e) {
+			this.log.error(e.getMessage(), e);
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (ClassNotFoundException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
 		return null;
 	}
 
 	@Override
 	public boolean checkExists(JobKey jobKey) throws JobPersistenceException {
-		// TODO Auto-generated method stub
+		this.log.trace("checkExists");
+		Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
+		km.put(KEY_KEY, new AttributeValue(formatKey(jobKey)));
+		GetItemRequest req = new GetItemRequest();
+		req.withTableName(this.tableNameJobs);
+		req.withKey(km);
+		req.withAttributesToGet(KEY_KEY);
+		try {
+			GetItemResult res = this.client.getItem(req);
+			Map<String, AttributeValue> item = res.getItem();
+			if (item != null && !item.isEmpty()) {
+				return true;
+			}
+		} catch (ConditionalCheckFailedException e) {
+			this.log.error(e.getMessage(), e);
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
 		return false;
 	}
 
 	@Override
 	public boolean checkExists(TriggerKey triggerKey)
 			throws JobPersistenceException {
-		// TODO Auto-generated method stub
+		this.log.trace("checkExists");
+		Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
+		km.put(KEY_KEY, new AttributeValue(formatKey(triggerKey)));
+		GetItemRequest req = new GetItemRequest();
+		req.withTableName(this.tableNameTriggers);
+		req.withKey(km);
+		req.withAttributesToGet(KEY_KEY);
+		try {
+			GetItemResult res = this.client.getItem(req);
+			Map<String, AttributeValue> item = res.getItem();
+			if (item != null && !item.isEmpty()) {
+				return true;
+			}
+		} catch (ConditionalCheckFailedException e) {
+			this.log.error(e.getMessage(), e);
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
 		return false;
 	}
 
 	@Override
 	public void clearAllSchedulingData() throws JobPersistenceException {
+		this.log.trace("clearAllSchedulingData");
 		// TODO Auto-generated method stub
-
 	}
 
 	@Override
 	public void storeCalendar(String name, Calendar calendar,
 			boolean replaceExisting, boolean updateTriggers)
 			throws ObjectAlreadyExistsException, JobPersistenceException {
+		this.log.trace("storeCalendar");
 		// TODO Auto-generated method stub
 
 	}
@@ -403,6 +543,7 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public boolean removeCalendar(String calName)
 			throws JobPersistenceException {
+		this.log.trace("removeCalendar");
 		// TODO Auto-generated method stub
 		return false;
 	}
@@ -410,155 +551,618 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public Calendar retrieveCalendar(String calName)
 			throws JobPersistenceException {
+		this.log.trace("retrieveCalendar");
 		// TODO Auto-generated method stub
 		return null;
 	}
 
 	@Override
 	public int getNumberOfJobs() throws JobPersistenceException {
-		// TODO Auto-generated method stub
-		return 0;
+		this.log.trace("getNumberOfJobs");
+		ScanRequest req = new ScanRequest();
+		req.withTableName(this.tableNameJobs);
+		req.withAttributesToGet(KEY_KEY);
+		try {
+			boolean hasMore = true;
+			ScanResult res = null;
+			int count = 0;
+			while (hasMore) {
+				hasMore = false;
+				res = this.client.scan(req);
+				count += res.getCount();
+				Map<String, AttributeValue> lastKey = res.getLastEvaluatedKey();
+				if (lastKey != null && !lastKey.isEmpty()) {
+					hasMore = true;
+					req.withExclusiveStartKey(lastKey);
+				}
+			}
+			return count;
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
 	}
 
 	@Override
 	public int getNumberOfTriggers() throws JobPersistenceException {
-		// TODO Auto-generated method stub
-		return 0;
+		this.log.trace("getNumberOfTriggers");
+		ScanRequest req = new ScanRequest();
+		req.withTableName(this.tableNameTriggers);
+		req.withAttributesToGet(KEY_KEY);
+		try {
+			boolean hasMore = true;
+			ScanResult res = null;
+			int count = 0;
+			while (hasMore) {
+				hasMore = false;
+				res = this.client.scan(req);
+				count += res.getCount();
+				Map<String, AttributeValue> lastKey = res.getLastEvaluatedKey();
+				if (lastKey != null && !lastKey.isEmpty()) {
+					hasMore = true;
+					req.withExclusiveStartKey(lastKey);
+				}
+			}
+			return count;
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
 	}
 
 	@Override
 	public int getNumberOfCalendars() throws JobPersistenceException {
-		// TODO Auto-generated method stub
-		return 0;
+		this.log.trace("getNumberOfCalendars");
+		ScanRequest req = new ScanRequest();
+		req.withTableName(this.tableNameCalendars);
+		req.withAttributesToGet(KEY_NAME);
+		try {
+			boolean hasMore = true;
+			ScanResult res = null;
+			int count = 0;
+			while (hasMore) {
+				hasMore = false;
+				res = this.client.scan(req);
+				count += res.getCount();
+				Map<String, AttributeValue> lastKey = res.getLastEvaluatedKey();
+				if (lastKey != null && !lastKey.isEmpty()) {
+					hasMore = true;
+					req.withExclusiveStartKey(lastKey);
+				}
+			}
+			return count;
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
 	}
 
 	@Override
 	public Set<JobKey> getJobKeys(GroupMatcher<JobKey> matcher)
 			throws JobPersistenceException {
-		// TODO Auto-generated method stub
-		return null;
+		this.log.trace("getJobKeys");
+		StringOperatorName op = matcher.getCompareWithOperator();
+		String val = matcher.getCompareToValue();
+		ScanRequest req = new ScanRequest();
+		req.withTableName(this.tableNameJobs);
+		req.withAttributesToGet(KEY_KEY, KEY_NAME, KEY_GROUP);
+		switch (op) {
+		case ANYTHING:
+			break;
+		case CONTAINS:
+			req.addScanFilterEntry(KEY_GROUP, new Condition()
+					.withComparisonOperator(ComparisonOperator.CONTAINS)
+					.withAttributeValueList(new AttributeValue(val)));
+			break;
+		case ENDS_WITH:
+			req.addScanFilterEntry(KEY_GROUP, new Condition()
+					.withComparisonOperator(ComparisonOperator.CONTAINS)
+					.withAttributeValueList(new AttributeValue(val)));
+			break;
+		case EQUALS:
+			req.addScanFilterEntry(KEY_GROUP, new Condition()
+					.withComparisonOperator(ComparisonOperator.EQ)
+					.withAttributeValueList(new AttributeValue(val)));
+			break;
+		case STARTS_WITH:
+			req.addScanFilterEntry(KEY_GROUP, new Condition()
+					.withComparisonOperator(ComparisonOperator.BEGINS_WITH)
+					.withAttributeValueList(new AttributeValue(val)));
+			break;
+		default:
+			throw new JobPersistenceException("Invalid matcher");
+		}
+		try {
+			boolean hasMore = true;
+			ScanResult res = null;
+			Set<JobKey> keys = new HashSet<JobKey>();
+			while (hasMore) {
+				hasMore = false;
+				res = this.client.scan(req);
+				for (Map<String, AttributeValue> item : res.getItems()) {
+					if (op == StringOperatorName.ENDS_WITH
+							&& !item.get(KEY_GROUP).getS().endsWith(val)) {
+						continue;
+					}
+					keys.add(new JobKey(item.get(KEY_NAME).getS(), item.get(
+							KEY_GROUP).getS()));
+				}
+				Map<String, AttributeValue> lastKey = res.getLastEvaluatedKey();
+				if (lastKey != null && !lastKey.isEmpty()) {
+					hasMore = true;
+					req.withExclusiveStartKey(lastKey);
+				}
+			}
+			return keys;
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
 	}
 
 	@Override
 	public Set<TriggerKey> getTriggerKeys(GroupMatcher<TriggerKey> matcher)
 			throws JobPersistenceException {
-		// TODO Auto-generated method stub
-		return null;
+		this.log.trace("getTriggerKeys");
+		StringOperatorName op = matcher.getCompareWithOperator();
+		String val = matcher.getCompareToValue();
+		ScanRequest req = new ScanRequest();
+		req.withTableName(this.tableNameTriggers);
+		req.withAttributesToGet(KEY_KEY, KEY_NAME, KEY_GROUP);
+		switch (op) {
+		case ANYTHING:
+			break;
+		case CONTAINS:
+			req.addScanFilterEntry(KEY_GROUP, new Condition()
+					.withComparisonOperator(ComparisonOperator.CONTAINS)
+					.withAttributeValueList(new AttributeValue(val)));
+			break;
+		case ENDS_WITH:
+			req.addScanFilterEntry(KEY_GROUP, new Condition()
+					.withComparisonOperator(ComparisonOperator.CONTAINS)
+					.withAttributeValueList(new AttributeValue(val)));
+			break;
+		case EQUALS:
+			req.addScanFilterEntry(KEY_GROUP, new Condition()
+					.withComparisonOperator(ComparisonOperator.EQ)
+					.withAttributeValueList(new AttributeValue(val)));
+			break;
+		case STARTS_WITH:
+			req.addScanFilterEntry(KEY_GROUP, new Condition()
+					.withComparisonOperator(ComparisonOperator.BEGINS_WITH)
+					.withAttributeValueList(new AttributeValue(val)));
+			break;
+		default:
+			throw new JobPersistenceException("Invalid matcher");
+		}
+		try {
+			boolean hasMore = true;
+			ScanResult res = null;
+			Set<TriggerKey> keys = new HashSet<TriggerKey>();
+			while (hasMore) {
+				hasMore = false;
+				res = this.client.scan(req);
+				for (Map<String, AttributeValue> item : res.getItems()) {
+					if (op == StringOperatorName.ENDS_WITH
+							&& !item.get(KEY_GROUP).getS().endsWith(val)) {
+						continue;
+					}
+					keys.add(new TriggerKey(item.get(KEY_NAME).getS(), item
+							.get(KEY_GROUP).getS()));
+				}
+				Map<String, AttributeValue> lastKey = res.getLastEvaluatedKey();
+				if (lastKey != null && !lastKey.isEmpty()) {
+					hasMore = true;
+					req.withExclusiveStartKey(lastKey);
+				}
+			}
+			return keys;
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
 	}
 
 	@Override
 	public List<String> getJobGroupNames() throws JobPersistenceException {
-		// TODO Auto-generated method stub
-		return null;
+		this.log.trace("getJobGroupNames");
+		ScanRequest req = new ScanRequest();
+		req.withTableName(this.tableNameJobs);
+		req.withAttributesToGet(KEY_KEY, KEY_GROUP);
+		try {
+			boolean hasMore = true;
+			ScanResult res = null;
+			Set<String> groups = new HashSet<String>();
+			while (hasMore) {
+				hasMore = false;
+				res = this.client.scan(req);
+				for (Map<String, AttributeValue> item : res.getItems()) {
+					groups.add(item.get(KEY_GROUP).getS());
+				}
+				Map<String, AttributeValue> lastKey = res.getLastEvaluatedKey();
+				if (lastKey != null && !lastKey.isEmpty()) {
+					hasMore = true;
+					req.withExclusiveStartKey(lastKey);
+				}
+			}
+			return new ArrayList<String>(groups);
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
 	}
 
 	@Override
 	public List<String> getTriggerGroupNames() throws JobPersistenceException {
-		// TODO Auto-generated method stub
-		return null;
+		this.log.trace("getTriggerGroupNames");
+		ScanRequest req = new ScanRequest();
+		req.withTableName(this.tableNameTriggers);
+		req.withAttributesToGet(KEY_KEY, KEY_GROUP);
+		try {
+			boolean hasMore = true;
+			ScanResult res = null;
+			Set<String> groups = new HashSet<String>();
+			while (hasMore) {
+				hasMore = false;
+				res = this.client.scan(req);
+				for (Map<String, AttributeValue> item : res.getItems()) {
+					groups.add(item.get(KEY_GROUP).getS());
+				}
+				Map<String, AttributeValue> lastKey = res.getLastEvaluatedKey();
+				if (lastKey != null && !lastKey.isEmpty()) {
+					hasMore = true;
+					req.withExclusiveStartKey(lastKey);
+				}
+			}
+			return new ArrayList<String>(groups);
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
 	}
 
 	@Override
 	public List<String> getCalendarNames() throws JobPersistenceException {
-		// TODO Auto-generated method stub
-		return null;
+		this.log.trace("getCalendarNames");
+		ScanRequest req = new ScanRequest();
+		req.withTableName(this.tableNameCalendars);
+		req.withAttributesToGet(KEY_NAME);
+		try {
+			boolean hasMore = true;
+			ScanResult res = null;
+			Set<String> groups = new HashSet<String>();
+			while (hasMore) {
+				hasMore = false;
+				res = this.client.scan(req);
+				for (Map<String, AttributeValue> item : res.getItems()) {
+					groups.add(item.get(KEY_NAME).getS());
+				}
+				Map<String, AttributeValue> lastKey = res.getLastEvaluatedKey();
+				if (lastKey != null && !lastKey.isEmpty()) {
+					hasMore = true;
+					req.withExclusiveStartKey(lastKey);
+				}
+			}
+			return new ArrayList<String>(groups);
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
 	}
 
 	@Override
 	public List<OperableTrigger> getTriggersForJob(JobKey jobKey)
 			throws JobPersistenceException {
-		// TODO Auto-generated method stub
-		return null;
+		this.log.trace("getTriggersForJob");
+		ScanRequest req = new ScanRequest();
+		req.withTableName(this.tableNameTriggers);
+		req.addScanFilterEntry(
+				KEY_JOB,
+				new Condition().withComparisonOperator(ComparisonOperator.EQ)
+						.withAttributeValueList(
+								new AttributeValue(formatKey(jobKey))));
+		try {
+			boolean hasMore = true;
+			ScanResult res = null;
+			List<OperableTrigger> triggers = new ArrayList<OperableTrigger>();
+			while (hasMore) {
+				hasMore = false;
+				res = this.client.scan(req);
+				for (Map<String, AttributeValue> item : res.getItems()) {
+					try {
+						triggers.add(itemToTrigger(item));
+					} catch (ClassNotFoundException e) {
+						this.log.error(e.getMessage(), e);
+					}
+				}
+				Map<String, AttributeValue> lastKey = res.getLastEvaluatedKey();
+				if (lastKey != null && !lastKey.isEmpty()) {
+					hasMore = true;
+					req.withExclusiveStartKey(lastKey);
+				}
+			}
+			return triggers;
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
 	}
 
 	@Override
 	public TriggerState getTriggerState(TriggerKey triggerKey)
 			throws JobPersistenceException {
-		// TODO Auto-generated method stub
-		return null;
+		this.log.trace("getTriggerState");
+		Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
+		km.put(KEY_KEY, new AttributeValue(formatKey(triggerKey)));
+		GetItemRequest req = new GetItemRequest();
+		req.withTableName(this.tableNameTriggers);
+		req.withKey(km);
+		req.withAttributesToGet(KEY_KEY, KEY_STATE);
+		try {
+			GetItemResult res = this.client.getItem(req);
+			Map<String, AttributeValue> item = res.getItem();
+			if (item != null && !item.isEmpty() && item.containsKey(KEY_STATE)) {
+				String state = strValue(item, KEY_STATE);
+				return TriggerState.valueOf(state);
+			}
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
+		return TriggerState.NONE;
 	}
 
 	@Override
 	public void pauseTrigger(TriggerKey triggerKey)
 			throws JobPersistenceException {
-		// TODO Auto-generated method stub
-
+		this.log.trace("pauseTrigger");
+		Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
+		km.put(KEY_KEY, new AttributeValue(formatKey(triggerKey)));
+		UpdateItemRequest req = new UpdateItemRequest();
+		req.withTableName(this.tableNameTriggers);
+		req.withKey(km);
+		req.withReturnValues(ReturnValue.UPDATED_OLD);
+		req.addAttributeUpdatesEntry(KEY_STATE, new AttributeValueUpdate(
+				new AttributeValue(TriggerState.PAUSED.name()),
+				AttributeAction.PUT));
+		// TODO: add condition if trigger is pausable
+		try {
+			UpdateItemResult res = this.client.updateItem(req);
+			Map<String, AttributeValue> oldItem = res.getAttributes();
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
 	}
 
 	@Override
 	public Collection<String> pauseTriggers(GroupMatcher<TriggerKey> matcher)
 			throws JobPersistenceException {
-		// TODO Auto-generated method stub
-		return null;
+		this.log.trace("pauseTriggers");
+		Collection<String> groups = new HashSet<String>();
+		Set<TriggerKey> keys = getTriggerKeys(matcher);
+		for (TriggerKey k : keys) {
+			pauseTrigger(k);
+			groups.add(k.getGroup());
+		}
+		return groups;
 	}
 
 	@Override
 	public void pauseJob(JobKey jobKey) throws JobPersistenceException {
-		// TODO Auto-generated method stub
-
+		this.log.trace("pauseJob");
+		Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
+		km.put(KEY_KEY, new AttributeValue(formatKey(jobKey)));
+		UpdateItemRequest req = new UpdateItemRequest();
+		req.withTableName(this.tableNameJobs);
+		req.withKey(km);
+		req.withReturnValues(ReturnValue.UPDATED_OLD);
+		req.addAttributeUpdatesEntry(KEY_STATE, new AttributeValueUpdate(
+				new AttributeValue(TriggerState.PAUSED.name()),
+				AttributeAction.PUT));
+		// TODO: add condition if job is pausable
+		try {
+			UpdateItemResult res = this.client.updateItem(req);
+			Map<String, AttributeValue> oldItem = res.getAttributes();
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
 	}
 
 	@Override
 	public Collection<String> pauseJobs(GroupMatcher<JobKey> groupMatcher)
 			throws JobPersistenceException {
-		// TODO Auto-generated method stub
-		return null;
+		this.log.trace("pauseJobs");
+		Collection<String> groups = new HashSet<String>();
+		Set<JobKey> keys = getJobKeys(groupMatcher);
+		for (JobKey k : keys) {
+			pauseJob(k);
+			groups.add(k.getGroup());
+		}
+		return groups;
 	}
 
 	@Override
 	public void resumeTrigger(TriggerKey triggerKey)
 			throws JobPersistenceException {
-		// TODO Auto-generated method stub
-
+		this.log.trace("resumeTrigger");
+		Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
+		km.put(KEY_KEY, new AttributeValue(formatKey(triggerKey)));
+		UpdateItemRequest req = new UpdateItemRequest();
+		req.withTableName(this.tableNameTriggers);
+		req.withKey(km);
+		req.withReturnValues(ReturnValue.UPDATED_OLD);
+		req.addAttributeUpdatesEntry(KEY_STATE, new AttributeValueUpdate(
+				new AttributeValue(TriggerState.NORMAL.name()),
+				AttributeAction.PUT));
+		// TODO: add condition if trigger is resumable
+		try {
+			UpdateItemResult res = this.client.updateItem(req);
+			Map<String, AttributeValue> oldItem = res.getAttributes();
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
 	}
 
 	@Override
 	public Collection<String> resumeTriggers(GroupMatcher<TriggerKey> matcher)
 			throws JobPersistenceException {
-		// TODO Auto-generated method stub
-		return null;
+		this.log.trace("resumeTriggers");
+		Collection<String> groups = new HashSet<String>();
+		Set<TriggerKey> keys = getTriggerKeys(matcher);
+		for (TriggerKey k : keys) {
+			resumeTrigger(k);
+			groups.add(k.getGroup());
+		}
+		return groups;
 	}
 
 	@Override
 	public Set<String> getPausedTriggerGroups() throws JobPersistenceException {
-		// TODO Auto-generated method stub
-		return null;
+		this.log.trace("getPausedTriggerGroups");
+		ScanRequest req = new ScanRequest();
+		req.withTableName(this.tableNameTriggers);
+		req.withAttributesToGet(KEY_KEY, KEY_GROUP, KEY_STATE);
+		req.addScanFilterEntry(
+				KEY_STATE,
+				new Condition().withComparisonOperator(ComparisonOperator.EQ)
+						.withAttributeValueList(
+								new AttributeValue(TriggerState.PAUSED.name())));
+		// TODO: should we only return groups where all triggers are paused?
+		try {
+			boolean hasMore = true;
+			ScanResult res = null;
+			Set<String> groups = new HashSet<String>();
+			while (hasMore) {
+				hasMore = false;
+				res = this.client.scan(req);
+				for (Map<String, AttributeValue> item : res.getItems()) {
+					groups.add(strValue(item, KEY_GROUP));
+				}
+				Map<String, AttributeValue> lastKey = res.getLastEvaluatedKey();
+				if (lastKey != null && !lastKey.isEmpty()) {
+					hasMore = true;
+					req.withExclusiveStartKey(lastKey);
+				}
+			}
+			return groups;
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
 	}
 
 	@Override
 	public void resumeJob(JobKey jobKey) throws JobPersistenceException {
-		// TODO Auto-generated method stub
-
+		this.log.trace("resumeJob");
+		Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
+		km.put(KEY_KEY, new AttributeValue(formatKey(jobKey)));
+		UpdateItemRequest req = new UpdateItemRequest();
+		req.withTableName(this.tableNameJobs);
+		req.withKey(km);
+		req.withReturnValues(ReturnValue.UPDATED_OLD);
+		req.addAttributeUpdatesEntry(KEY_STATE, new AttributeValueUpdate(
+				new AttributeValue(TriggerState.NORMAL.name()),
+				AttributeAction.PUT));
+		// TODO: add condition if job is pausable
+		try {
+			UpdateItemResult res = this.client.updateItem(req);
+			Map<String, AttributeValue> oldItem = res.getAttributes();
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
 	}
 
 	@Override
 	public Collection<String> resumeJobs(GroupMatcher<JobKey> matcher)
 			throws JobPersistenceException {
-		// TODO Auto-generated method stub
-		return null;
+		this.log.trace("resumeJobs");
+		Collection<String> groups = new HashSet<String>();
+		Set<JobKey> keys = getJobKeys(matcher);
+		for (JobKey k : keys) {
+			resumeJob(k);
+			groups.add(k.getGroup());
+		}
+		return groups;
 	}
 
 	@Override
 	public void pauseAll() throws JobPersistenceException {
-		// TODO Auto-generated method stub
-
+		this.log.trace("pauseAll");
+		Set<TriggerKey> keys = getTriggerKeys(GroupMatcher.anyTriggerGroup());
+		for (TriggerKey k : keys) {
+			pauseTrigger(k);
+		}
 	}
 
 	@Override
 	public void resumeAll() throws JobPersistenceException {
-		// TODO Auto-generated method stub
-
+		this.log.trace("resumeAll");
+		Set<TriggerKey> keys = getTriggerKeys(GroupMatcher.anyTriggerGroup());
+		for (TriggerKey k : keys) {
+			resumeTrigger(k);
+		}
 	}
 
 	@Override
 	public List<OperableTrigger> acquireNextTriggers(long noLaterThan,
 			int maxCount, long timeWindow) throws JobPersistenceException {
+		this.log.trace("acquireNextTriggers");
 		// TODO Auto-generated method stub
 		return null;
 	}
 
 	@Override
 	public void releaseAcquiredTrigger(OperableTrigger trigger) {
+		this.log.trace("releaseAcquiredTrigger");
 		// TODO Auto-generated method stub
 
 	}
@@ -566,6 +1170,7 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public List<TriggerFiredResult> triggersFired(List<OperableTrigger> triggers)
 			throws JobPersistenceException {
+		this.log.trace("triggersFired");
 		// TODO Auto-generated method stub
 		return null;
 	}
@@ -573,32 +1178,49 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public void triggeredJobComplete(OperableTrigger trigger,
 			JobDetail jobDetail, CompletedExecutionInstruction triggerInstCode) {
+		this.log.trace("triggeredJobComplete");
 		// TODO Auto-generated method stub
 
 	}
 
 	@Override
 	public void setInstanceId(String instanceId) {
+		this.log.trace("setInstanceId");
 		this.instanceId = instanceId;
 	}
 
 	@Override
 	public void setInstanceName(String instanceName) {
+		this.log.trace("setInstanceName");
 		this.instanceName = instanceName;
 	}
 
 	@Override
 	public void setThreadPoolSize(int poolSize) {
+		this.log.trace("setThreadPoolSize");
 		this.poolSize = poolSize;
 	}
 
+	public void setPrefix(String prefix) {
+		this.log.trace("setPrefix");
+		this.prefix = prefix;
+		if (this.prefix != null && !this.prefix.isEmpty()) {
+			this.tableNameCalendars = this.prefix + "_"
+					+ this.tableNameCalendars;
+			this.tableNameJobs = this.prefix + "_" + this.tableNameJobs;
+			this.tableNameTriggers = this.prefix + "_" + this.tableNameTriggers;
+		}
+	}
+
 	public void setRegion(String region) {
+		this.log.trace("setRegion");
 		this.region = Region.getRegion(Regions.fromName(region));
 	}
 
 	public void setEndpoint(String endpoint) {
+		this.log.trace("setEndpoint");
 		this.endpoint = endpoint;
-		if (endpoint != null && !endpoint.isEmpty()) {
+		if (this.endpoint != null && !this.endpoint.isEmpty()) {
 			try {
 				URL url = new URL(this.endpoint);
 				this.useEndpoint = true;
@@ -611,9 +1233,81 @@ public class DynamoDBJobStore implements JobStore {
 		}
 	}
 
+	private static String formatKey(Key<?> k) {
+		return k.getGroup() + ":" + k.getName();
+	}
+
+	private static JobKey parseJobKey(String k) {
+		if (k != null && !k.isEmpty()) {
+			String[] p = k.split(":");
+			if (p.length >= 2) {
+				return new JobKey(p[1], p[0]);
+			}
+		}
+		return null;
+	}
+
+	private static TriggerKey parseTriggerKey(String k) {
+		if (k != null && !k.isEmpty()) {
+			String[] p = k.split(":");
+			if (p.length >= 2) {
+				return new TriggerKey(p[1], p[0]);
+			}
+		}
+		return null;
+	}
+
+	private void init() {
+		if (!Tables.doesTableExist(this.client, this.tableNameCalendars)) {
+			this.log.error("Creating table: " + this.tableNameCalendars);
+			this.client
+					.createTable(Arrays.asList(new AttributeDefinition()
+							.withAttributeName(KEY_NAME).withAttributeType(
+									ScalarAttributeType.S)),
+							this.tableNameCalendars, Arrays
+									.asList(new KeySchemaElement()
+											.withAttributeName(KEY_NAME)
+											.withKeyType(KeyType.HASH)),
+							new ProvisionedThroughput(2L, 2L));
+		}
+		if (!Tables.doesTableExist(this.client, this.tableNameJobs)) {
+			this.log.error("Creating table: " + this.tableNameJobs);
+			this.client.createTable(
+					Arrays.asList(new AttributeDefinition().withAttributeName(
+							KEY_KEY).withAttributeType(ScalarAttributeType.S)),
+					this.tableNameJobs,
+					Arrays.asList(new KeySchemaElement().withAttributeName(
+							KEY_KEY).withKeyType(KeyType.HASH)),
+					new ProvisionedThroughput(2L, 2L));
+		}
+		if (!Tables.doesTableExist(this.client, this.tableNameTriggers)) {
+			this.log.error("Creating table: " + this.tableNameTriggers);
+			this.client.createTable(
+					Arrays.asList(new AttributeDefinition().withAttributeName(
+							KEY_KEY).withAttributeType(ScalarAttributeType.S)),
+					this.tableNameTriggers,
+					Arrays.asList(new KeySchemaElement().withAttributeName(
+							KEY_KEY).withKeyType(KeyType.HASH)),
+					new ProvisionedThroughput(2L, 2L));
+		}
+		try {
+			Tables.awaitTableToBecomeActive(this.client,
+					this.tableNameCalendars, 60000, 1000);
+			Tables.awaitTableToBecomeActive(this.client,
+					this.tableNameTriggers, 60000, 1000);
+			Tables.awaitTableToBecomeActive(this.client, this.tableNameJobs,
+					60000, 1000);
+		} catch (InterruptedException e) {
+			this.log.error(e.getMessage(), e);
+			this.shutdown();
+		}
+	}
+
 	private Map<String, AttributeValue> jobToItem(JobDetail j) {
 		Map<String, AttributeValue> item = new HashMap<String, AttributeValue>();
-		attr(item, KEY_KEY, j.getKey().toString());
+		attr(item, KEY_KEY, formatKey(j.getKey()));
+		attr(item, KEY_GROUP, j.getKey().getGroup());
+		attr(item, KEY_NAME, j.getKey().getName());
 		attr(item, KEY_CLASS, j.getJobClass().getName());
 		attr(item, KEY_DESCRIPTION, j.getDescription());
 		attr(item, KEY_DURABLE, j.isDurable());
@@ -625,8 +1319,10 @@ public class DynamoDBJobStore implements JobStore {
 
 	private Map<String, AttributeValue> triggerToItem(Trigger t) {
 		Map<String, AttributeValue> item = new HashMap<String, AttributeValue>();
-		attr(item, KEY_KEY, t.getKey().toString());
-		attr(item, KEY_JOB, t.getJobKey().toString());
+		attr(item, KEY_KEY, formatKey(t.getKey()));
+		attr(item, KEY_GROUP, t.getKey().getGroup());
+		attr(item, KEY_NAME, t.getKey().getName());
+		attr(item, KEY_JOB, formatKey(t.getJobKey()));
 		attr(item, KEY_CLASS, t.getClass().getName());
 		attr(item, KEY_DESCRIPTION, t.getDescription());
 		attr(item, KEY_PRIORITY, t.getPriority());
@@ -640,16 +1336,16 @@ public class DynamoDBJobStore implements JobStore {
 		attr(item, KEY_DATA, t.getJobDataMap());
 		// Trigger specific
 		if (t instanceof SimpleTrigger) {
-			attr(item, KEY_TYPE, "simple");
+			attr(item, KEY_TYPE, TRIGGERTYPE_SIMPLE);
 			attr(item, KEY_COUNT, ((SimpleTrigger) t).getRepeatCount());
 			attr(item, KEY_INTERVAL, ((SimpleTrigger) t).getRepeatInterval());
 			attr(item, KEY_TIMES, ((SimpleTrigger) t).getTimesTriggered());
 		} else if (t instanceof CronTrigger) {
-			attr(item, KEY_TYPE, "cron");
+			attr(item, KEY_TYPE, TRIGGERTYPE_CRON);
 			attr(item, KEY_CRON, ((CronTrigger) t).getCronExpression());
 			attr(item, KEY_TIMEZONE, ((CronTrigger) t).getTimeZone());
 		} else {
-			// attr(item, KEY_TYPE, "unknown");
+			attr(item, KEY_TYPE, TRIGGERTYPE_UNKNOWN);
 		}
 		return item;
 	}
@@ -675,18 +1371,127 @@ public class DynamoDBJobStore implements JobStore {
 		return item;
 	}
 
-	private JobDetail itemToJob(Item item) throws ClassNotFoundException {
-		JobKey key = new JobKey(item.getString(KEY_KEY));
+	private static Map<String, Object> itemToMap(
+			Map<String, AttributeValue> item) {
+		Map<String, Object> map = new HashMap<String, Object>();
+		for (String k : item.keySet()) {
+			AttributeValue v = item.get(k);
+			if (v.isNULL()) {
+			} else if (v.isBOOL()) {
+				map.put(k, v.getBOOL());
+			} else {
+				map.put(k, v.getS());
+			}
+		}
+		return map;
+	}
+
+	private JobDetail itemToJob(Map<String, AttributeValue> item)
+			throws ClassNotFoundException {
+		JobKey key = new JobKey(item.get(KEY_KEY).getS());
 		Class<Job> cls = (Class<Job>) this.loadHelper.getClassLoader()
-				.loadClass(item.getString(KEY_CLASS));
+				.loadClass(item.get(KEY_CLASS).getS());
 		JobBuilder builder = JobBuilder.newJob(cls).withIdentity(key)
-				.withDescription(item.getString(KEY_DESCRIPTION))
-				.storeDurably(item.getBoolean(KEY_DURABLE));
-		Map<String, Object> m = item.getMap(KEY_DATA);
+				.withDescription(item.get(KEY_DESCRIPTION).getS())
+				.storeDurably(item.get(KEY_DURABLE).getBOOL());
+		Map<String, AttributeValue> m = item.get(KEY_DATA).getM();
 		if (m != null && !m.isEmpty()) {
-			builder.usingJobData(new JobDataMap(m));
+			builder.usingJobData(new JobDataMap(itemToMap(m)));
 		}
 		return builder.build();
+	}
+
+	private OperableTrigger itemToTrigger(Map<String, AttributeValue> item)
+			throws ClassNotFoundException {
+		OperableTrigger t = null;
+		String type = item.get(KEY_TYPE).getS();
+		if (type != null) {
+			if (TRIGGERTYPE_SIMPLE.equalsIgnoreCase(type)) {
+				t = new SimpleTriggerImpl();
+				Integer c = intValue(item, KEY_COUNT);
+				if (c != null) {
+					((SimpleTriggerImpl) t).setRepeatCount(c);
+				}
+				Long i = longValue(item, KEY_INTERVAL);
+				if (i != null) {
+					((SimpleTriggerImpl) t).setRepeatInterval(c);
+				}
+				Integer x = intValue(item, KEY_TIMES);
+				if (x != null) {
+					((SimpleTriggerImpl) t).setTimesTriggered(x);
+				}
+			} else if (TRIGGERTYPE_CRON.equalsIgnoreCase(type)) {
+				t = new CronTriggerImpl();
+				String c = strValue(item, KEY_CRON);
+				if (c != null && !c.isEmpty()) {
+					try {
+						((CronTriggerImpl) t).setCronExpression(c);
+					} catch (ParseException e) {
+						this.log.error(e.getMessage(), e);
+					}
+				}
+				String tz = strValue(item, KEY_TIMEZONE);
+				if (tz != null && !tz.isEmpty()) {
+					((CronTriggerImpl) t).setTimeZone(TimeZone.getTimeZone(tz));
+				}
+			}
+		}
+		if (t != null) {
+			t.setKey(parseTriggerKey(strValue(item, KEY_KEY)));
+			t.setJobKey(parseJobKey(strValue(item, KEY_JOB)));
+			t.setKey(parseTriggerKey(strValue(item, KEY_KEY)));
+			t.setDescription(strValue(item, KEY_DESCRIPTION));
+			t.setFireInstanceId(strValue(item, KEY_INSTANCE));
+			t.setCalendarName(strValue(item, KEY_CALENDAR));
+			t.setPriority(intValue(item, KEY_DESCRIPTION));
+			t.setMisfireInstruction(intValue(item, KEY_MISFIRE));
+			t.setStartTime(dateValue(item, KEY_START));
+			t.setEndTime(dateValue(item, KEY_END));
+			t.setNextFireTime(dateValue(item, KEY_NEXT));
+			t.setPreviousFireTime(dateValue(item, KEY_PREV));
+		}
+		return t;
+	}
+
+	private static String strValue(Map<String, AttributeValue> map, String key) {
+		AttributeValue value = map.get(key);
+		if (value != null) {
+			return value.getS();
+		}
+		return null;
+	}
+
+	private static Long longValue(Map<String, AttributeValue> map, String key) {
+		AttributeValue value = map.get(key);
+		if (value != null) {
+			String n = value.getN();
+			if (n != null && !n.isEmpty()) {
+				return Long.valueOf(n, 10);
+			}
+		}
+		return null;
+	}
+
+	private static Integer intValue(Map<String, AttributeValue> map, String key) {
+		AttributeValue value = map.get(key);
+		if (value != null) {
+			String n = value.getN();
+			if (n != null && !n.isEmpty()) {
+				return Integer.valueOf(n, 10);
+			}
+		}
+		return null;
+	}
+
+	private static Date dateValue(Map<String, AttributeValue> map, String key) {
+		AttributeValue value = map.get(key);
+		if (value != null) {
+			String n = value.getN();
+			if (n != null && !n.isEmpty()) {
+				return new Date(Long.valueOf(n, 10));
+			}
+		}
+		return null;
 	}
 
 	private static void attr(Map<String, AttributeValue> map, String key,
@@ -753,5 +1558,4 @@ public class DynamoDBJobStore implements JobStore {
 			map.put(key, new AttributeValue(value.getID()));
 		}
 	}
-
 }
