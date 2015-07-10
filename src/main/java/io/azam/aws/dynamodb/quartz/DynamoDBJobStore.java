@@ -1,5 +1,10 @@
 package io.azam.aws.dynamodb.quartz;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.text.ParseException;
@@ -15,6 +20,8 @@ import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
 import java.util.TimeZone;
+
+import javax.xml.bind.DatatypeConverter;
 
 import org.quartz.Calendar;
 import org.quartz.CronTrigger;
@@ -129,6 +136,7 @@ public class DynamoDBJobStore implements JobStore {
 	public static final String KEY_LOCKED = "locked";
 	public static final String KEY_LOCKEDBY = "lockedBy";
 	public static final String KEY_LOCKEDAT = "lockedAt";
+	public static final String KEY_BASE = "base";
 
 	// Trigger types
 	public static final String TRIGGERTYPE_CRON = "cron";
@@ -534,23 +542,90 @@ public class DynamoDBJobStore implements JobStore {
 			boolean replaceExisting, boolean updateTriggers)
 			throws ObjectAlreadyExistsException, JobPersistenceException {
 		this.log.trace("storeCalendar");
-		// TODO Auto-generated method stub
-
+		Map<String, AttributeValue> item = calendarToItem(calendar);
+		item.put(KEY_NAME, new AttributeValue().withS(name));
+		this.log.trace("  item: " + item.toString());
+		PutItemRequest req = new PutItemRequest();
+		req.withTableName(this.tableNameCalendars);
+		req.withItem(item);
+		if (!replaceExisting) {
+			req.addExpectedEntry(KEY_NAME, new ExpectedAttributeValue(false));
+		}
+		try {
+			PutItemResult res = this.client.putItem(req);
+		} catch (ConditionalCheckFailedException e) {
+			this.log.error(e.getMessage(), e);
+			throw new ObjectAlreadyExistsException(name);
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
+		if (updateTriggers) {
+			List<OperableTrigger> tl = new ArrayList<OperableTrigger>();
+			// TODO: get all triggers with this calendar name
+			for (OperableTrigger t : tl) {
+				t.updateWithNewCalendar(calendar, this.misfireThreshold);
+				storeTrigger(t, true);
+			}
+		}
 	}
 
 	@Override
 	public boolean removeCalendar(String calName)
 			throws JobPersistenceException {
 		this.log.trace("removeCalendar");
-		// TODO Auto-generated method stub
-		return false;
+		Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
+		km.put(KEY_NAME, new AttributeValue(calName));
+		DeleteItemRequest req = new DeleteItemRequest();
+		req.withTableName(this.tableNameCalendars);
+		req.withKey(km);
+		req.addExpectedEntry(KEY_NAME, new ExpectedAttributeValue(true)
+				.withValue(new AttributeValue(calName)));
+		try {
+			DeleteItemResult res = this.client.deleteItem(req);
+			return true;
+		} catch (ConditionalCheckFailedException e) {
+			this.log.error(e.getMessage(), e);
+			return false;
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
 	}
 
 	@Override
 	public Calendar retrieveCalendar(String calName)
 			throws JobPersistenceException {
 		this.log.trace("retrieveCalendar");
-		// TODO Auto-generated method stub
+		Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
+		km.put(KEY_NAME, new AttributeValue(calName));
+		GetItemRequest req = new GetItemRequest();
+		req.withTableName(this.tableNameCalendars);
+		req.withKey(km);
+		try {
+			GetItemResult res = this.client.getItem(req);
+			Map<String, AttributeValue> item = res.getItem();
+			if (item != null && !item.isEmpty()) {
+				return itemToCalendar(item);
+			}
+		} catch (ConditionalCheckFailedException e) {
+			this.log.error(e.getMessage(), e);
+		} catch (AmazonServiceException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (AmazonClientException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		} catch (ClassNotFoundException e) {
+			this.log.error(e.getMessage(), e);
+			throw new JobPersistenceException(e.getMessage(), e);
+		}
 		return null;
 	}
 
@@ -1211,7 +1286,10 @@ public class DynamoDBJobStore implements JobStore {
 		}
 		List<OperableTrigger> acquired = new ArrayList<OperableTrigger>();
 		for (OperableTrigger t : triggers) {
+			this.log.debug(triggerToItem(t).toString());
 			if (applyMisfire(t) && t.getNextFireTime() == null) {
+				this.log.debug("misfired");
+				this.log.debug(triggerToItem(t).toString());
 				continue;
 			}
 			// storeTrigger(t, true, TriggerState.BLOCKED);
@@ -1255,6 +1333,7 @@ public class DynamoDBJobStore implements JobStore {
 				}
 			}
 			Date prev = t.getPreviousFireTime();
+			Date next = t.getNextFireTime();
 			this.log.trace(t.toString());
 			t.triggered(cal);
 			this.log.trace(t.toString());
@@ -1875,6 +1954,17 @@ public class DynamoDBJobStore implements JobStore {
 		return item;
 	}
 
+	private Map<String, AttributeValue> calendarToItem(Calendar c) {
+		Map<String, AttributeValue> item = new HashMap<String, AttributeValue>();
+		attr(item, KEY_CLASS, c.getClass().getName());
+		attr(item, KEY_DESCRIPTION, c.getDescription());
+		if (c.getBaseCalendar() != null) {
+			attr(item, KEY_BASE, serialize(c.getBaseCalendar()));
+		}
+		attr(item, KEY_DATA, serialize(c));
+		return item;
+	}
+
 	private synchronized void clearTable(String name, String... keys) {
 		this.log.trace("clearTable: " + name);
 		List<Map<String, AttributeValue>> allKeys = new ArrayList<Map<String, AttributeValue>>();
@@ -2041,6 +2131,12 @@ public class DynamoDBJobStore implements JobStore {
 		return t;
 	}
 
+	private Calendar itemToCalendar(Map<String, AttributeValue> item)
+			throws ClassNotFoundException {
+		String s = item.get(KEY_DATA).getS();
+		return (Calendar) deserialize(s);
+	}
+
 	private static String strValue(Map<String, AttributeValue> map, String key) {
 		AttributeValue value = map.get(key);
 		if (value != null) {
@@ -2165,5 +2261,66 @@ public class DynamoDBJobStore implements JobStore {
 		if (value != null) {
 			map.put(key, new AttributeValue(value.getID()));
 		}
+	}
+
+	private static String serialize(Object o) {
+		ByteArrayOutputStream baos = null;
+		ObjectOutputStream oos = null;
+		try {
+			baos = new ByteArrayOutputStream();
+			oos = new ObjectOutputStream(baos);
+			oos.writeObject(o);
+			oos.flush();
+			baos.flush();
+			return DatatypeConverter.printBase64Binary(baos.toByteArray());
+		} catch (IOException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		} finally {
+			if (baos != null) {
+				try {
+					baos.close();
+				} catch (IOException e) {
+				}
+			}
+			if (oos != null) {
+				try {
+					oos.close();
+				} catch (IOException e) {
+				}
+			}
+		}
+		return null;
+	}
+
+	private static Object deserialize(String s) {
+		ByteArrayInputStream bais = null;
+		ObjectInputStream ois = null;
+		try {
+			byte[] b = DatatypeConverter.parseBase64Binary(s);
+			bais = new ByteArrayInputStream(b);
+			ois = new ObjectInputStream(bais);
+			return ois.readObject();
+		} catch (IOException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		} catch (ClassNotFoundException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		} finally {
+			if (bais != null) {
+				try {
+					bais.close();
+				} catch (IOException e) {
+				}
+			}
+			if (ois != null) {
+				try {
+					ois.close();
+				} catch (IOException e) {
+				}
+			}
+		}
+		return null;
 	}
 }
