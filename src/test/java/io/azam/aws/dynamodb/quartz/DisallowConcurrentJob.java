@@ -15,6 +15,7 @@ public class DisallowConcurrentJob implements Job {
 			throws JobExecutionException {
 		long now = System.currentTimeMillis();
 		SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
-		System.out.println("DisallowConcurrentJob: " + f.format(new Date(now)));
+		System.out.println("#### DisallowConcurrentJob: "
+				+ f.format(new Date(now)));
 	}
 }

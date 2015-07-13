@@ -25,7 +25,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import javax.xml.bind.DatatypeConverter;
 
 import org.quartz.Calendar;
-import org.quartz.CronScheduleBuilder;
 import org.quartz.CronTrigger;
 import org.quartz.Job;
 import org.quartz.JobBuilder;
@@ -34,16 +33,13 @@ import org.quartz.JobDetail;
 import org.quartz.JobKey;
 import org.quartz.JobPersistenceException;
 import org.quartz.ObjectAlreadyExistsException;
-import org.quartz.Scheduler;
 import org.quartz.SchedulerConfigException;
 import org.quartz.SchedulerException;
 import org.quartz.SimpleTrigger;
 import org.quartz.Trigger;
 import org.quartz.Trigger.CompletedExecutionInstruction;
 import org.quartz.Trigger.TriggerState;
-import org.quartz.TriggerBuilder;
 import org.quartz.TriggerKey;
-import org.quartz.impl.StdSchedulerFactory;
 import org.quartz.impl.matchers.GroupMatcher;
 import org.quartz.impl.matchers.StringMatcher.StringOperatorName;
 import org.quartz.impl.triggers.CronTriggerImpl;
@@ -67,6 +63,7 @@ import com.amazonaws.auth.SystemPropertiesCredentialsProvider;
 import com.amazonaws.auth.profile.ProfileCredentialsProvider;
 import com.amazonaws.regions.Region;
 import com.amazonaws.regions.Regions;
+import com.amazonaws.services.dynamodbv2.AmazonDynamoDB;
 import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClient;
 import com.amazonaws.services.dynamodbv2.model.AttributeAction;
 import com.amazonaws.services.dynamodbv2.model.AttributeDefinition;
@@ -119,6 +116,7 @@ public class DynamoDBJobStore implements JobStore {
 	public static final String KEY_STATE = "state";
 	public static final String KEY_TYPE = "type";
 	public static final String KEY_DESCRIPTION = "description";
+	public static final String KEY_SUMMARY = "summary";
 	public static final String KEY_DURABLE = "durable";
 	public static final String KEY_CONCURRENT = "concurrent";
 	public static final String KEY_PERSIST = "persist";
@@ -142,6 +140,7 @@ public class DynamoDBJobStore implements JobStore {
 	public static final String KEY_LOCKEDBY = "lockedBy";
 	public static final String KEY_LOCKEDAT = "lockedAt";
 	public static final String KEY_BASE = "base";
+	public static final String KEY_BYTECODE = "byteCode";
 
 	// Trigger types
 	public static final String TRIGGERTYPE_CRON = "cron";
@@ -170,7 +169,7 @@ public class DynamoDBJobStore implements JobStore {
 	private final Object initLock = new Object();
 	private ClassLoadHelper loadHelper;
 	private SchedulerSignaler signaler;
-	private AmazonDynamoDBClient client;
+	private AmazonDynamoDB client;
 	private String tableNameJobs = DEFAULT_JOBS;
 	private String tableNameCalendars = DEFAULT_CALENDARS;
 	private String tableNameTriggers = DEFAULT_TRIGGERS;
@@ -202,10 +201,10 @@ public class DynamoDBJobStore implements JobStore {
 			this.client = new AmazonDynamoDBClient(auth);
 			if (this.useEndpoint) {
 				this.log.info("Using endpoint: " + this.endpoint);
-				this.client.withEndpoint(this.endpoint);
+				this.client.setEndpoint(this.endpoint);
 			} else {
 				this.log.info("Using region: " + this.region.getName());
-				this.client.withRegion(this.region);
+				this.client.setRegion(this.region);
 			}
 			init();
 		}
@@ -329,7 +328,7 @@ public class DynamoDBJobStore implements JobStore {
 
 	@Override
 	public boolean removeJob(JobKey jobKey) throws JobPersistenceException {
-		this.log.trace("removeJob");
+		this.log.trace("removeJob: " + formatKey(jobKey));
 		Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
 		km.put(KEY_KEY, new AttributeValue(formatKey(jobKey)));
 		DeleteItemRequest req = new DeleteItemRequest();
@@ -405,7 +404,7 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public boolean removeTrigger(TriggerKey triggerKey)
 			throws JobPersistenceException {
-		this.log.trace("removeTrigger");
+		this.log.trace("removeTrigger: " + formatKey(triggerKey));
 		Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
 		km.put(KEY_KEY, new AttributeValue(formatKey(triggerKey)));
 		DeleteItemRequest req = new DeleteItemRequest();
@@ -538,6 +537,7 @@ public class DynamoDBJobStore implements JobStore {
 			req.addExpectedEntry(KEY_NAME, new ExpectedAttributeValue(false));
 		}
 		try {
+			this.log.trace("  putting key: " + item.get(KEY_NAME).getS());
 			PutItemResult res = this.client.putItem(req);
 		} catch (ConditionalCheckFailedException e) {
 			this.log.error(e.getMessage(), e);
@@ -561,7 +561,7 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public boolean removeCalendar(String calName)
 			throws JobPersistenceException {
-		this.log.trace("removeCalendar");
+		this.log.trace("removeCalendar: " + calName);
 		List<OperableTrigger> tl = getTriggersForCalendar(calName);
 		if (tl.size() > 0) {
 			throw new JobPersistenceException("Triggers using calendar "
@@ -712,7 +712,7 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public Set<JobKey> getJobKeys(GroupMatcher<JobKey> matcher)
 			throws JobPersistenceException {
-		this.log.trace("getJobKeys");
+		this.log.trace("getJobKeys: " + matcher.toString());
 		StringOperatorName op = matcher.getCompareWithOperator();
 		String val = matcher.getCompareToValue();
 		ScanRequest req = new ScanRequest();
@@ -778,7 +778,7 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public Set<TriggerKey> getTriggerKeys(GroupMatcher<TriggerKey> matcher)
 			throws JobPersistenceException {
-		this.log.trace("getTriggerKeys");
+		this.log.trace("getTriggerKeys: " + matcher.toString());
 		StringOperatorName op = matcher.getCompareWithOperator();
 		String val = matcher.getCompareToValue();
 		ScanRequest req = new ScanRequest();
@@ -955,7 +955,7 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public List<OperableTrigger> getTriggersForJob(JobKey jobKey)
 			throws JobPersistenceException {
-		this.log.trace("getTriggersForJob");
+		this.log.trace("getTriggersForJob: " + formatKey(jobKey));
 		ScanRequest req = new ScanRequest();
 		req.withTableName(this.tableNameTriggers);
 		req.addScanFilterEntry(
@@ -1001,7 +1001,7 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public TriggerState getTriggerState(TriggerKey triggerKey)
 			throws JobPersistenceException {
-		this.log.trace("getTriggerState");
+		this.log.trace("getTriggerState: " + formatKey(triggerKey));
 		Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
 		km.put(KEY_KEY, new AttributeValue(formatKey(triggerKey)));
 		GetItemRequest req = new GetItemRequest();
@@ -1028,7 +1028,7 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public void pauseTrigger(TriggerKey triggerKey)
 			throws JobPersistenceException {
-		this.log.trace("pauseTrigger");
+		this.log.trace("pauseTrigger: " + formatKey(triggerKey));
 		Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
 		km.put(KEY_KEY, new AttributeValue(formatKey(triggerKey)));
 		UpdateItemRequest req = new UpdateItemRequest();
@@ -1044,6 +1044,7 @@ public class DynamoDBJobStore implements JobStore {
 						ComparisonOperator.EQ).withAttributeValueList(
 						new AttributeValue(TriggerState.NORMAL.name())));
 		try {
+			this.log.trace("  updating key: " + km.get(KEY_KEY).getS());
 			UpdateItemResult res = this.client.updateItem(req);
 			Map<String, AttributeValue> oldItem = res.getAttributes();
 		} catch (ConditionalCheckFailedException e) {
@@ -1060,7 +1061,7 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public Collection<String> pauseTriggers(GroupMatcher<TriggerKey> matcher)
 			throws JobPersistenceException {
-		this.log.trace("pauseTriggers");
+		this.log.trace("pauseTriggers: " + matcher.toString());
 		Collection<String> groups = new HashSet<String>();
 		Set<TriggerKey> keys = getTriggerKeys(matcher);
 		for (TriggerKey k : keys) {
@@ -1072,7 +1073,7 @@ public class DynamoDBJobStore implements JobStore {
 
 	@Override
 	public void pauseJob(JobKey jobKey) throws JobPersistenceException {
-		this.log.trace("pauseJob");
+		this.log.trace("pauseJob: " + formatKey(jobKey));
 		Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
 		km.put(KEY_KEY, new AttributeValue(formatKey(jobKey)));
 		UpdateItemRequest req = new UpdateItemRequest();
@@ -1085,6 +1086,7 @@ public class DynamoDBJobStore implements JobStore {
 		req.addExpectedEntry(KEY_STATE, new ExpectedAttributeValue()
 				.withComparisonOperator(ComparisonOperator.NULL));
 		try {
+			this.log.trace("  updating key: " + km.get(KEY_KEY).getS());
 			UpdateItemResult res = this.client.updateItem(req);
 			Map<String, AttributeValue> oldItem = res.getAttributes();
 		} catch (ConditionalCheckFailedException e) {
@@ -1105,7 +1107,7 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public Collection<String> pauseJobs(GroupMatcher<JobKey> groupMatcher)
 			throws JobPersistenceException {
-		this.log.trace("pauseJobs");
+		this.log.trace("pauseJobs: " + groupMatcher.toString());
 		Collection<String> groups = new HashSet<String>();
 		Set<JobKey> keys = getJobKeys(groupMatcher);
 		for (JobKey k : keys) {
@@ -1118,7 +1120,7 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public void resumeTrigger(TriggerKey triggerKey)
 			throws JobPersistenceException {
-		this.log.trace("resumeTrigger");
+		this.log.trace("resumeTrigger: " + formatKey(triggerKey));
 		Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
 		km.put(KEY_KEY, new AttributeValue(formatKey(triggerKey)));
 		UpdateItemRequest req = new UpdateItemRequest();
@@ -1134,6 +1136,7 @@ public class DynamoDBJobStore implements JobStore {
 						ComparisonOperator.EQ).withAttributeValueList(
 						new AttributeValue(TriggerState.PAUSED.name())));
 		try {
+			this.log.trace("  updating key: " + km.get(KEY_KEY).getS());
 			UpdateItemResult res = this.client.updateItem(req);
 			if (res != null) {
 				Map<String, AttributeValue> item = res.getAttributes();
@@ -1160,7 +1163,7 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public Collection<String> resumeTriggers(GroupMatcher<TriggerKey> matcher)
 			throws JobPersistenceException {
-		this.log.trace("resumeTriggers");
+		this.log.trace("resumeTriggers: " + matcher.toString());
 		Collection<String> groups = new HashSet<String>();
 		Set<TriggerKey> keys = getTriggerKeys(matcher);
 		for (TriggerKey k : keys) {
@@ -1215,7 +1218,7 @@ public class DynamoDBJobStore implements JobStore {
 
 	@Override
 	public void resumeJob(JobKey jobKey) throws JobPersistenceException {
-		this.log.trace("resumeJob");
+		this.log.trace("resumeJob: " + formatKey(jobKey));
 		Map<String, AttributeValue> km = new HashMap<String, AttributeValue>();
 		km.put(KEY_KEY, new AttributeValue(formatKey(jobKey)));
 		UpdateItemRequest req = new UpdateItemRequest();
@@ -1230,6 +1233,7 @@ public class DynamoDBJobStore implements JobStore {
 						ComparisonOperator.EQ).withAttributeValueList(
 						new AttributeValue(TriggerState.PAUSED.name())));
 		try {
+			this.log.trace("  updating key: " + km.get(KEY_KEY).getS());
 			UpdateItemResult res = this.client.updateItem(req);
 			Map<String, AttributeValue> oldItem = res.getAttributes();
 		} catch (ConditionalCheckFailedException e) {
@@ -1250,7 +1254,7 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public Collection<String> resumeJobs(GroupMatcher<JobKey> matcher)
 			throws JobPersistenceException {
-		this.log.trace("resumeJobs");
+		this.log.trace("resumeJobs: " + matcher.toString());
 		Collection<String> groups = new HashSet<String>();
 		Set<JobKey> keys = getJobKeys(matcher);
 		for (JobKey k : keys) {
@@ -1281,15 +1285,16 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public List<OperableTrigger> acquireNextTriggers(long noLaterThan,
 			int maxCount, long timeWindow) throws JobPersistenceException {
-		this.log.trace("acquireNextTriggers");
-		// this.log.trace(printTable(this.tableNameTriggers));
+		this.log.trace("acquireNextTriggers: noLaterThan: " + noLaterThan
+				+ " maxCount: " + maxCount + " timeWindow: " + timeWindow);
+		this.log.trace("\n" + printTable(this.tableNameTriggers));
 		ScanRequest req = new ScanRequest();
 		req.withTableName(this.tableNameTriggers);
-		// req.addScanFilterEntry(
-		// KEY_STATE,
-		// new Condition().withComparisonOperator(ComparisonOperator.EQ)
-		// .withAttributeValueList(
-		// new AttributeValue(TriggerState.NORMAL.name())));
+		req.addScanFilterEntry(
+				KEY_STATE,
+				new Condition().withComparisonOperator(ComparisonOperator.EQ)
+						.withAttributeValueList(
+								new AttributeValue(TriggerState.NORMAL.name())));
 		req.addScanFilterEntry(
 				KEY_NEXT,
 				new Condition().withComparisonOperator(ComparisonOperator.LE)
@@ -1331,17 +1336,16 @@ public class DynamoDBJobStore implements JobStore {
 		}
 		List<OperableTrigger> acquired = new ArrayList<OperableTrigger>();
 		for (OperableTrigger t : triggers) {
-			this.log.debug("  acquiring target: " + triggerToItem(t).toString());
+			this.log.debug("  acquiring target: " + t.toString());
 			if (applyMisfire(t)) {
 				this.log.debug("    misfired");
 				if (t.getNextFireTime() == null) {
-					this.log.debug("      but no next");
-					this.log.debug(triggerToItem(t).toString());
+					this.log.debug("      no next");
 					removeTrigger(t.getKey());
 				} else {
-					this.log.debug("      but has next");
-					acquire(t.getKey());
-					acquired.add(t);
+					this.log.debug("      has next");
+					// acquire(t.getKey());
+					// acquired.add(t);
 				}
 			} else {
 				this.log.debug("    not misfired");
@@ -1349,12 +1353,13 @@ public class DynamoDBJobStore implements JobStore {
 				acquired.add(t);
 			}
 		}
+		this.log.trace("\n" + printTable(this.tableNameTriggers));
 		return acquired;
 	}
 
 	@Override
 	public void releaseAcquiredTrigger(OperableTrigger trigger) {
-		this.log.trace("releaseAcquiredTrigger");
+		this.log.trace("releaseAcquiredTrigger: " + formatKey(trigger.getKey()));
 		try {
 			release(trigger.getKey());
 		} catch (ObjectAlreadyExistsException e) {
@@ -1375,13 +1380,14 @@ public class DynamoDBJobStore implements JobStore {
 			}
 			OperableTrigger t2 = retrieveTrigger(t.getKey(), true);
 			if (t2 == null) {
-				this.log.error("Trigger deleted during execution: "
+				this.log.error("Trigger released or deleted during execution: "
 						+ formatKey(t.getKey()));
 				continue;
 			}
-			this.log.trace("  trigger: " + formatKey(t.getKey()));
+			this.log.trace("  fired trigger: " + formatKey(t.getKey()));
 			Calendar cal = null;
 			if (t.getCalendarName() != null) {
+				this.log.trace("  calendar: " + t.getCalendarName());
 				cal = retrieveCalendar(t.getCalendarName());
 				if (cal == null) {
 					this.log.error("Calendar used for trigger is null: "
@@ -1389,10 +1395,11 @@ public class DynamoDBJobStore implements JobStore {
 					continue;
 				}
 			}
+			this.log.trace("before: " + t.toString());
 			Date prev = t.getPreviousFireTime();
 			Date next = t.getNextFireTime();
 			t.triggered(cal);
-			this.log.trace(t.toString());
+			this.log.trace("after: " + t.toString());
 			this.log.trace("  next: " + t.getNextFireTime());
 			JobDetail j2 = retrieveJob(t.getJobKey());
 			if (j2 == null) {
@@ -1416,17 +1423,19 @@ public class DynamoDBJobStore implements JobStore {
 				} else {
 					this.log.trace("Trigger job is concurrent: "
 							+ formatKey(t.getJobKey()));
+					// release(t.getKey());
 				}
 			}
 			if (t.getNextFireTime() != null) {
 				this.log.trace("Trigger has next: " + formatKey(t.getKey()));
+				storeTrigger(t, true);
 				changeState(t.getKey(), TriggerState.NORMAL);
 				release(t.getKey());
 			} else {
 				this.log.trace("Trigger has no next: " + formatKey(t.getKey()));
+				storeTrigger(t, true);
 				changeState(t.getKey(), TriggerState.COMPLETE);
 				release(t.getKey());
-				// removeTrigger(t.getKey());
 			}
 			fired.add(new TriggerFiredResult(bundle));
 		}
@@ -1436,10 +1445,8 @@ public class DynamoDBJobStore implements JobStore {
 	@Override
 	public void triggeredJobComplete(OperableTrigger trigger,
 			JobDetail jobDetail, CompletedExecutionInstruction triggerInstCode) {
-		this.log.trace("triggeredJobComplete");
-		this.log.trace("  triggerInstCode: " + triggerInstCode.toString());
-		// this.log.trace(printTable(this.tableNameJobs));
-		// this.log.trace(printTable(this.tableNameTriggers));
+		this.log.trace("triggeredJobComplete: triggerInstCode: "
+				+ triggerInstCode);
 
 		// check for job deleted during execution
 		JobDetail j = null;
@@ -1466,7 +1473,6 @@ public class DynamoDBJobStore implements JobStore {
 			if (j.isConcurrentExectionDisallowed()) {
 				this.log.trace("  job not concurrent");
 				try {
-					release(trigger.getJobKey());
 					List<TriggerKey> l = getTriggerKeysForJob(trigger
 							.getJobKey());
 					if (l != null) {
@@ -1474,6 +1480,7 @@ public class DynamoDBJobStore implements JobStore {
 							release(tk);
 						}
 					}
+					release(trigger.getJobKey());
 				} catch (JobPersistenceException e) {
 					this.log.error(e.getMessage(), e);
 				}
@@ -1491,33 +1498,30 @@ public class DynamoDBJobStore implements JobStore {
 			this.log.error("Trigger is deleted: " + formatKey(trigger.getKey()));
 		} else {
 			switch (triggerInstCode) {
+			case NOOP:
+				break;
 			case DELETE_TRIGGER:
-				try {
-					removeTrigger(trigger.getKey());
-				} catch (JobPersistenceException e) {
-					this.log.error(e.getMessage(), e);
+				if (trigger.getNextFireTime() == null) {
+					this.log.trace("  trigger next is null");
+					try {
+						if (t.getNextFireTime() == null) {
+							this.log.trace("  t next is null");
+							removeTrigger(trigger.getKey());
+						} else {
+							this.log.trace("  t next is not null");
+						}
+					} catch (JobPersistenceException e) {
+						this.log.error(e.getMessage(), e);
+					}
+				} else {
+					this.log.trace("  trigger has next");
+					try {
+						removeTrigger(trigger.getKey());
+						this.signaler.signalSchedulingChange(0L);
+					} catch (JobPersistenceException e) {
+						this.log.error(e.getMessage(), e);
+					}
 				}
-				// if (trigger.getNextFireTime() == null) {
-				// this.log.trace("  trigger next is null");
-				// try {
-				// if (t.getNextFireTime() == null) {
-				// this.log.trace("  t next is null");
-				// removeTrigger(trigger.getKey());
-				// } else {
-				// this.log.trace("  t next is not null");
-				// }
-				// } catch (JobPersistenceException e) {
-				// this.log.error(e.getMessage(), e);
-				// }
-				// } else {
-				// this.log.trace("  trigger has next");
-				// try {
-				// removeTrigger(trigger.getKey());
-				// this.signaler.signalSchedulingChange(0L);
-				// } catch (JobPersistenceException e) {
-				// this.log.error(e.getMessage(), e);
-				// }
-				// }
 				break;
 			case SET_TRIGGER_COMPLETE:
 				try {
@@ -1637,12 +1641,6 @@ public class DynamoDBJobStore implements JobStore {
 		this.clustered = clustered;
 	}
 
-	private synchronized String getFireInstanceId(TriggerKey tk) {
-		long cnt = this.fireCounter.incrementAndGet();
-		return formatKey(tk) + "_" + this.instanceName + "_" + this.instanceId
-				+ "_" + Long.toHexString(cnt);
-	}
-
 	private static String formatKey(Key<?> k) {
 		return k.getGroup() + ":" + k.getName();
 	}
@@ -1669,7 +1667,7 @@ public class DynamoDBJobStore implements JobStore {
 
 	private void init() {
 		if (!Tables.doesTableExist(this.client, this.tableNameCalendars)) {
-			this.log.error("Creating table: " + this.tableNameCalendars);
+			this.log.warn("Creating table: " + this.tableNameCalendars);
 			this.client
 					.createTable(Arrays.asList(new AttributeDefinition()
 							.withAttributeName(KEY_NAME).withAttributeType(
@@ -1681,7 +1679,7 @@ public class DynamoDBJobStore implements JobStore {
 							new ProvisionedThroughput(2L, 2L));
 		}
 		if (!Tables.doesTableExist(this.client, this.tableNameJobs)) {
-			this.log.error("Creating table: " + this.tableNameJobs);
+			this.log.warn("Creating table: " + this.tableNameJobs);
 			this.client.createTable(
 					Arrays.asList(new AttributeDefinition().withAttributeName(
 							KEY_KEY).withAttributeType(ScalarAttributeType.S)),
@@ -1691,7 +1689,7 @@ public class DynamoDBJobStore implements JobStore {
 					new ProvisionedThroughput(2L, 2L));
 		}
 		if (!Tables.doesTableExist(this.client, this.tableNameTriggers)) {
-			this.log.error("Creating table: " + this.tableNameTriggers);
+			this.log.warn("Creating table: " + this.tableNameTriggers);
 			this.client.createTable(
 					Arrays.asList(new AttributeDefinition().withAttributeName(
 							KEY_KEY).withAttributeType(ScalarAttributeType.S)),
@@ -1703,10 +1701,10 @@ public class DynamoDBJobStore implements JobStore {
 		try {
 			Tables.awaitTableToBecomeActive(this.client,
 					this.tableNameCalendars, 60000, 1000);
-			Tables.awaitTableToBecomeActive(this.client,
-					this.tableNameTriggers, 60000, 1000);
 			Tables.awaitTableToBecomeActive(this.client, this.tableNameJobs,
 					60000, 1000);
+			Tables.awaitTableToBecomeActive(this.client,
+					this.tableNameTriggers, 60000, 1000);
 		} catch (InterruptedException e) {
 			this.log.error(e.getMessage(), e);
 			this.shutdown();
@@ -1778,6 +1776,7 @@ public class DynamoDBJobStore implements JobStore {
 						new AttributeValue().withBOOL(true)));
 		req.withReturnValues(ReturnValue.UPDATED_OLD);
 		try {
+			this.log.trace("  updating key: " + km.get(KEY_KEY).getS());
 			UpdateItemResult res = this.client.updateItem(req);
 			return true;
 		} catch (ConditionalCheckFailedException e) {
@@ -1818,6 +1817,7 @@ public class DynamoDBJobStore implements JobStore {
 						new AttributeValue().withBOOL(true)));
 		req.withReturnValues(ReturnValue.UPDATED_OLD);
 		try {
+			this.log.trace("  updating key: " + km.get(KEY_KEY).getS());
 			UpdateItemResult res = this.client.updateItem(req);
 			return true;
 		} catch (ConditionalCheckFailedException e) {
@@ -1853,6 +1853,7 @@ public class DynamoDBJobStore implements JobStore {
 						new AttributeValue().withBOOL(false)));
 		req.withReturnValues(ReturnValue.UPDATED_OLD);
 		try {
+			this.log.trace("  updating key: " + km.get(KEY_KEY).getS());
 			UpdateItemResult res = this.client.updateItem(req);
 			return true;
 		} catch (ConditionalCheckFailedException e) {
@@ -1888,6 +1889,7 @@ public class DynamoDBJobStore implements JobStore {
 						new AttributeValue().withBOOL(false)));
 		req.withReturnValues(ReturnValue.UPDATED_OLD);
 		try {
+			this.log.trace("  updating key: " + km.get(KEY_KEY).getS());
 			UpdateItemResult res = this.client.updateItem(req);
 			return true;
 		} catch (ConditionalCheckFailedException e) {
@@ -1928,6 +1930,7 @@ public class DynamoDBJobStore implements JobStore {
 		}
 		req.withReturnValues(ReturnValue.UPDATED_OLD);
 		try {
+			this.log.trace("  updating key: " + km.get(KEY_KEY).getS());
 			UpdateItemResult res = this.client.updateItem(req);
 			if (res != null && res.getAttributes() != null
 					&& res.getAttributes().containsKey(KEY_STATE)) {
@@ -1974,6 +1977,7 @@ public class DynamoDBJobStore implements JobStore {
 		}
 		req.withReturnValues(ReturnValue.UPDATED_OLD);
 		try {
+			this.log.trace("  updating key: " + km.get(KEY_KEY).getS());
 			UpdateItemResult res = this.client.updateItem(req);
 			if (res != null && res.getAttributes() != null
 					&& res.getAttributes().containsKey(KEY_STATE)) {
@@ -2018,6 +2022,7 @@ public class DynamoDBJobStore implements JobStore {
 		this.log.trace("  entry: " + req.getAttributeUpdates());
 		req.withReturnValues(ReturnValue.UPDATED_OLD);
 		try {
+			this.log.trace("  updating key: " + km.get(KEY_KEY).getS());
 			UpdateItemResult res = this.client.updateItem(req);
 			if (res != null && res.getAttributes() != null
 					&& res.getAttributes().containsKey(KEY_DATA)) {
@@ -2040,8 +2045,8 @@ public class DynamoDBJobStore implements JobStore {
 	private void storeJob(JobDetail newJob, boolean replaceExisting,
 			TriggerState state) throws ObjectAlreadyExistsException,
 			JobPersistenceException {
-		this.log.trace("storeJob: " + formatKey(newJob.getKey()) + " state: "
-				+ state);
+		this.log.trace("storeJob: " + formatKey(newJob.getKey()) + " replace: "
+				+ replaceExisting + " state: " + state);
 		Map<String, AttributeValue> item = jobToItem(newJob);
 		if (state != null) {
 			attr(item, KEY_STATE, state.name());
@@ -2049,11 +2054,12 @@ public class DynamoDBJobStore implements JobStore {
 		this.log.trace("  item: " + item.toString());
 		PutItemRequest req = new PutItemRequest();
 		req.withTableName(this.tableNameJobs);
-		req.withItem(jobToItem(newJob));
+		req.withItem(item);
 		if (!replaceExisting) {
 			req.addExpectedEntry(KEY_KEY, new ExpectedAttributeValue(false));
 		}
 		try {
+			this.log.trace("  putting key: " + item.get(KEY_KEY).getS());
 			PutItemResult res = this.client.putItem(req);
 		} catch (ConditionalCheckFailedException e) {
 			this.log.error(e.getMessage(), e);
@@ -2071,7 +2077,7 @@ public class DynamoDBJobStore implements JobStore {
 			boolean replaceExisting, TriggerState state)
 			throws ObjectAlreadyExistsException, JobPersistenceException {
 		this.log.trace("storeTrigger: " + formatKey(newTrigger.getKey())
-				+ " state: " + state);
+				+ " replace: " + replaceExisting + " state: " + state);
 		Map<String, AttributeValue> item = triggerToItem(newTrigger);
 		if (state != null) {
 			attr(item, KEY_STATE, state.name());
@@ -2084,6 +2090,7 @@ public class DynamoDBJobStore implements JobStore {
 			req.addExpectedEntry(KEY_KEY, new ExpectedAttributeValue(false));
 		}
 		try {
+			this.log.trace("  putting key: " + item.get(KEY_KEY).getS());
 			PutItemResult res = this.client.putItem(req);
 		} catch (ConditionalCheckFailedException e) {
 			this.log.error(e.getMessage(), e);
@@ -2245,7 +2252,7 @@ public class DynamoDBJobStore implements JobStore {
 		attr(item, KEY_NEXT, t.getNextFireTime());
 		attr(item, KEY_PREV, t.getPreviousFireTime());
 		attr(item, KEY_START, t.getStartTime());
-		attr(item, KEY_END, t.getStartTime());
+		attr(item, KEY_END, t.getEndTime());
 		attr(item, KEY_FINAL, t.getFinalFireTime());
 		attr(item, KEY_DATA, t.getJobDataMap());
 		// Trigger specific
@@ -2260,6 +2267,7 @@ public class DynamoDBJobStore implements JobStore {
 			attr(item, KEY_TIMEZONE, ((CronTrigger) t).getTimeZone());
 		} else {
 			attr(item, KEY_TYPE, TRIGGERTYPE_UNKNOWN);
+			attr(item, KEY_BYTECODE, serialize(t));
 		}
 		return item;
 	}
@@ -2307,11 +2315,33 @@ public class DynamoDBJobStore implements JobStore {
 		Queue<Map<String, AttributeValue>> queue = new LinkedList<Map<String, AttributeValue>>(
 				keys);
 		while (!queue.isEmpty()) {
+			Map<String, AttributeValue> k = queue.poll();
+			this.log.trace("deleting " + k.toString() + " from " + name);
+			DeleteItemRequest req = new DeleteItemRequest();
+			req.withTableName(name);
+			req.withKey(k);
+			try {
+				DeleteItemResult res = this.client.deleteItem(req);
+			} catch (AmazonServiceException e) {
+				this.log.error(e.getMessage(), e);
+			} catch (AmazonClientException e) {
+				this.log.error(e.getMessage(), e);
+			}
+		}
+	}
+
+	private synchronized void batchDeleteItems(String name,
+			List<Map<String, AttributeValue>> keys) {
+		Queue<Map<String, AttributeValue>> queue = new LinkedList<Map<String, AttributeValue>>(
+				keys);
+		while (!queue.isEmpty()) {
 			List<WriteRequest> l = new ArrayList<WriteRequest>(
 					DYNAMODB_MAXBATCHWRITE);
 			for (int i = 0; !queue.isEmpty() && i < DYNAMODB_MAXBATCHWRITE; i++) {
+				Map<String, AttributeValue> k = queue.poll();
+				this.log.trace("deleting " + k.toString() + " from " + name);
 				DeleteRequest dr = new DeleteRequest();
-				dr.withKey(queue.poll());
+				dr.withKey(k);
 				WriteRequest wr = new WriteRequest();
 				wr.withDeleteRequest(dr);
 				l.add(wr);
@@ -2379,7 +2409,8 @@ public class DynamoDBJobStore implements JobStore {
 		JobKey key = parseJobKey(strValue(item, KEY_KEY));
 		Class<Job> cls = (Class<Job>) this.loadHelper.getClassLoader()
 				.loadClass(strValue(item, KEY_CLASS));
-		JobBuilder builder = JobBuilder.newJob(cls).withIdentity(key)
+		JobBuilder builder = JobBuilder.newJob(cls)
+				.withIdentity(key.getName(), key.getGroup())
 				.withDescription(strValue(item, KEY_DESCRIPTION))
 				.storeDurably(boolValue(item, KEY_DURABLE));
 		Map<String, Object> m = mapValue(item, KEY_DATA);
@@ -2422,12 +2453,13 @@ public class DynamoDBJobStore implements JobStore {
 				if (tz != null && !tz.isEmpty()) {
 					((CronTriggerImpl) t).setTimeZone(TimeZone.getTimeZone(tz));
 				}
+			} else {
+				t = (OperableTrigger) deserialize(strValue(item, KEY_BYTECODE));
 			}
 		}
-		if (t != null) {
+		if (t != null && !TRIGGERTYPE_UNKNOWN.equalsIgnoreCase(type)) {
 			t.setKey(parseTriggerKey(strValue(item, KEY_KEY)));
 			t.setJobKey(parseJobKey(strValue(item, KEY_JOB)));
-			t.setKey(parseTriggerKey(strValue(item, KEY_KEY)));
 			t.setDescription(strValue(item, KEY_DESCRIPTION));
 			t.setFireInstanceId(strValue(item, KEY_INSTANCE));
 			t.setCalendarName(strValue(item, KEY_CALENDAR));
@@ -2662,57 +2694,5 @@ public class DynamoDBJobStore implements JobStore {
 			}
 		}
 		return sb.toString();
-	}
-
-	public static void main(String[] args) {
-		JobDetail j1 = JobBuilder.newJob(ConcurrentJob.class)
-				.withIdentity("concurrent", "group")
-				.withDescription("重複可能なジョブです").build();
-		CronTrigger t1 = TriggerBuilder
-				.newTrigger()
-				.withIdentity("concurrentTrigger", "group")
-				.withDescription("重複可能なトリガーです")
-				.withSchedule(CronScheduleBuilder.cronSchedule("0 0/1 * * * ?"))
-				.forJob("concurrent", "group").build();
-		JobDetail j2 = JobBuilder.newJob(DisallowConcurrentJob.class)
-				.withIdentity("disallowConcurrent", "group")
-				.withDescription("重複不可能なジョブです").build();
-		CronTrigger t2 = TriggerBuilder
-				.newTrigger()
-				.withIdentity("disallowConcurrentTrigger", "group")
-				.withDescription("重複不可能なトリガーです")
-				.withSchedule(CronScheduleBuilder.cronSchedule("0 0/1 * * * ?"))
-				.forJob("disallowConcurrent", "group").build();
-		Scheduler s = null;
-		try {
-			s = new StdSchedulerFactory().getScheduler();
-			s.clear();
-			s.start();
-			s.scheduleJob(j1, t1);
-			s.scheduleJob(j2, t2);
-		} catch (SchedulerException e) {
-			// TODO Auto-generated catch block
-			e.printStackTrace();
-		}
-
-		try {
-			int k = -1;
-			while (k != '\n') {
-				k = System.in.read();
-			}
-		} catch (IOException e) {
-			// TODO Auto-generated catch block
-			e.printStackTrace();
-		} finally {
-			try {
-				if (s != null) {
-					s.shutdown(false);
-				}
-			} catch (SchedulerException e) {
-				// TODO Auto-generated catch block
-				e.printStackTrace();
-			}
-			System.out.println("Shutdown OK");
-		}
 	}
 }
