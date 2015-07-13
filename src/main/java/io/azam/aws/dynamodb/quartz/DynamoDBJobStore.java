@@ -2570,6 +2570,7 @@ public class DynamoDBJobStore implements JobStore {
 			baos.flush();
 			return DatatypeConverter.printBase64Binary(baos.toByteArray());
 		} catch (IOException e) {
+			LOG.error(e.getMessage(), e);
 		} finally {
 			if (baos != null) {
 				try {
@@ -2596,11 +2597,9 @@ public class DynamoDBJobStore implements JobStore {
 			ois = new ObjectInputStream(bais);
 			return ois.readObject();
 		} catch (IOException e) {
-			// TODO Auto-generated catch block
-			e.printStackTrace();
+			LOG.error(e.getMessage(), e);
 		} catch (ClassNotFoundException e) {
-			// TODO Auto-generated catch block
-			e.printStackTrace();
+			LOG.error(e.getMessage(), e);
 		} finally {
 			if (bais != null) {
 				try {
